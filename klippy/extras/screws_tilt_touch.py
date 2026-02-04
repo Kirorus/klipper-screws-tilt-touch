@@ -185,6 +185,71 @@ class ScrewsTiltTouch:
         y_offset = float(cfg.y_offset)
         return (nx + x_offset, ny + y_offset)
 
+    def _compute_nozzle_bounds(self, touch) -> Optional[_SimpleBounds]:
+        """
+        Compute safe nozzle XY bounds that keep the Cartographer coil within mesh_min/max.
+        Intersects with axis limits to avoid moving outside kinematics.
+        """
+        cfg = getattr(touch, "_config", None)
+        if cfg is None or self.toolhead is None:
+            return None
+
+        mesh_min_x, mesh_min_y = cfg.mesh_min
+        mesh_max_x, mesh_max_y = cfg.mesh_max
+        x_offset = float(cfg.x_offset)
+        y_offset = float(cfg.y_offset)
+
+        # coil_xy = nozzle_xy + offset -> nozzle_xy = coil_xy - offset
+        min_x = float(mesh_min_x) - x_offset
+        max_x = float(mesh_max_x) - x_offset
+        min_y = float(mesh_min_y) - y_offset
+        max_y = float(mesh_max_y) - y_offset
+
+        if min_x > max_x:
+            min_x, max_x = max_x, min_x
+        if min_y > max_y:
+            min_y, max_y = max_y, min_y
+
+        curtime = self.printer.get_reactor().monotonic()
+        st = self.toolhead.get_status(curtime)
+        amin = st.get("axis_minimum", [0.0, 0.0, 0.0])
+        amax = st.get("axis_maximum", [0.0, 0.0, 0.0])
+
+        min_x = max(min_x, float(amin[0]))
+        max_x = min(max_x, float(amax[0]))
+        min_y = max(min_y, float(amin[1]))
+        max_y = min(max_y, float(amax[1]))
+
+        return _SimpleBounds(min_x=min_x, max_x=max_x, min_y=min_y, max_y=max_y)
+
+    def _get_axis_bounds(self) -> Optional[_SimpleBounds]:
+        if self.toolhead is None:
+            return None
+        curtime = self.printer.get_reactor().monotonic()
+        st = self.toolhead.get_status(curtime)
+        amin = st.get("axis_minimum", [0.0, 0.0, 0.0])
+        amax = st.get("axis_maximum", [0.0, 0.0, 0.0])
+        return _SimpleBounds(
+            min_x=float(amin[0]),
+            max_x=float(amax[0]),
+            min_y=float(amin[1]),
+            max_y=float(amax[1]),
+        )
+
+    def _clamp_xy(
+        self,
+        x: float,
+        y: float,
+        bounds: Optional[_SimpleBounds],
+        clamp_x: bool,
+        clamp_y: bool,
+    ) -> tuple[float, float, bool]:
+        if bounds is None:
+            return (x, y, False)
+        cx = x if not clamp_x else min(max(x, bounds.min_x), bounds.max_x)
+        cy = y if not clamp_y else min(max(y, bounds.min_y), bounds.max_y)
+        return (cx, cy, (cx != x or cy != y))
+
     def _get_travel_via_xy(self) -> Optional[tuple[float, float]]:
         if self.travel_via == "none":
             return None
@@ -296,6 +361,8 @@ class ScrewsTiltTouch:
         speed = gcmd.get_float("SPEED", self.speed_mm_s, above=1.0)
         z_safe = gcmd.get_float("Z", self.horizontal_move_z, above=0.0)
         samples = gcmd.get_int("SAMPLES", 1, minval=1)
+        clamp_x = bool(gcmd.get_int("CLAMP_X", 1, minval=0, maxval=1))
+        clamp_y = bool(gcmd.get_int("CLAMP_Y", 1, minval=0, maxval=1))
 
         curtime = self.printer.get_reactor().monotonic()
         homed_axes = (self.toolhead.get_status(curtime).get("homed_axes") or "")
@@ -306,7 +373,9 @@ class ScrewsTiltTouch:
 
         touch = self._get_cartographer_touch()
         original_boundaries = getattr(touch, "boundaries", None)
-        boundaries = original_boundaries
+        safe_bounds = self._compute_nozzle_bounds(touch)
+        axis_bounds = self._get_axis_bounds()
+        boundaries = safe_bounds or axis_bounds or original_boundaries
 
         try:
             max_temp = touch._config.max_touch_temperature  # type: ignore[attr-defined]
@@ -320,70 +389,76 @@ class ScrewsTiltTouch:
                     f"Nozzle too hot for touch probing ({temp:.1f}C > {max_temp}C). Cool down first."
                 )
 
+        cfg = getattr(touch, "_config", None)
+        x_off = float(cfg.x_offset) if cfg is not None else 0.0
+        y_off = float(cfg.y_offset) if cfg is not None else 0.0
         self.gcode.respond_info(
-            f"SCREWS_TILT_TOUCH: probing {len(self.screws)} screws with Cartographer TOUCH (pitch {self.pitch}mm/turn, thread {self.screw_thread})"
+            "SCREWS_TILT_TOUCH: "
+            f"{len(self.screws)} screws, "
+            f"pitch {self.pitch}mm/turn {self.screw_thread}, "
+            f"samples={samples}, "
+            f"clamp_x={int(clamp_x)} clamp_y={int(clamp_y)}, "
+            f"offset=({x_off:.2f},{y_off:.2f})"
         )
-        self.gcode.respond_info(
-            f"SCREWS_TILT_TOUCH: pretrigger_retries={self.pretrigger_retries} pretrigger_lift={self.pretrigger_lift:.2f}mm pretrigger_dwell_ms={self.pretrigger_dwell_ms}"
-        )
-        self.gcode.respond_info(
-            f"SCREWS_TILT_TOUCH: post_probe_lift={self.post_probe_lift:.2f}mm post_probe_dwell_ms={self.post_probe_dwell_ms}"
-        )
-        self.gcode.respond_info(f"SCREWS_TILT_TOUCH: samples_per_point={samples}")
+
+        if safe_bounds is not None and axis_bounds is not None:
+            eff_min_x = axis_bounds.min_x if not clamp_x else safe_bounds.min_x
+            eff_max_x = axis_bounds.max_x if not clamp_x else safe_bounds.max_x
+            eff_min_y = axis_bounds.min_y if not clamp_y else safe_bounds.min_y
+            eff_max_y = axis_bounds.max_y if not clamp_y else safe_bounds.max_y
+            boundaries = _SimpleBounds(min_x=eff_min_x, max_x=eff_max_x, min_y=eff_min_y, max_y=eff_max_y)
+
         if boundaries is not None:
             self.gcode.respond_info(
-                f"SCREWS_TILT_TOUCH: touch bounds X=[{boundaries.min_x:.2f},{boundaries.max_x:.2f}] Y=[{boundaries.min_y:.2f},{boundaries.max_y:.2f}]"
+                f"SCREWS_TILT_TOUCH: bounds X=[{boundaries.min_x:.2f},{boundaries.max_x:.2f}] "
+                f"Y=[{boundaries.min_y:.2f},{boundaries.max_y:.2f}]"
             )
 
-        cfg = getattr(touch, "_config")
-        x_offset = float(cfg.x_offset)
-        y_offset = float(cfg.y_offset)
-
-        probe_plan: list[tuple[ScrewPoint, float, float, float, float]] = []
+        probe_plan: list[tuple[ScrewPoint, float, float, float, float, bool]] = []
+        clamped_report: list[tuple[str, float, float, float, float]] = []
         for sp in self.screws:
             screw_nx, screw_ny = float(sp.x), float(sp.y)
-            probe_nx = screw_nx - x_offset
-            probe_ny = screw_ny - y_offset
-            probe_plan.append((sp, screw_nx, screw_ny, probe_nx, probe_ny))
+            if safe_bounds is not None:
+                if not clamp_x and not (safe_bounds.min_x <= screw_nx <= safe_bounds.max_x):
+                    self.gcode.respond_info(f"SCREWS_TILT_TOUCH: warn clamp_x=0, {sp.label} x={screw_nx:.2f} out of safe")
+                if not clamp_y and not (safe_bounds.min_y <= screw_ny <= safe_bounds.max_y):
+                    self.gcode.respond_info(f"SCREWS_TILT_TOUCH: warn clamp_y=0, {sp.label} y={screw_ny:.2f} out of safe")
+            probe_nx, probe_ny, clamped = self._clamp_xy(screw_nx, screw_ny, boundaries, clamp_x, clamp_y)
+            probe_plan.append((sp, screw_nx, screw_ny, probe_nx, probe_ny, clamped))
+            if clamped:
+                clamped_report.append((sp.label, screw_nx, screw_ny, probe_nx, probe_ny))
 
         restored = False
         try:
-            if self.override_touch_bounds and original_boundaries is not None:
-                needs = any(
-                    not original_boundaries.is_within(x=pnx, y=pny) for (_sp, _sx, _sy, pnx, pny) in probe_plan
+            if boundaries is not None and original_boundaries is not None:
+                touch.boundaries = boundaries
+                restored = True
+                self.gcode.respond_info(
+                    f"SCREWS_TILT_TOUCH: apply bounds X=[{boundaries.min_x:.2f},{boundaries.max_x:.2f}] "
+                    f"Y=[{boundaries.min_y:.2f},{boundaries.max_y:.2f}]"
                 )
-                if needs:
-                    curtime = self.printer.get_reactor().monotonic()
-                    st = self.toolhead.get_status(curtime)
-                    amin = st.get("axis_minimum", [0.0, 0.0, 0.0])
-                    amax = st.get("axis_maximum", [0.0, 0.0, 0.0])
-
-                    xs = [pnx for (_sp, _sx, _sy, pnx, _pny) in probe_plan]
-                    ys = [pny for (_sp, _sx, _sy, _pnx, pny) in probe_plan]
-                    m = float(self.override_touch_bounds_margin)
-                    min_x = max(float(amin[0]), min(xs) - m)
-                    max_x = min(float(amax[0]), max(xs) + m)
-                    min_y = max(float(amin[1]), min(ys) - m)
-                    max_y = min(float(amax[1]), max(ys) + m)
-
-                    touch.boundaries = _SimpleBounds(min_x=min_x, max_x=max_x, min_y=min_y, max_y=max_y)
-                    boundaries = touch.boundaries
-                    restored = True
-                    self.gcode.respond_info(
-                        f"SCREWS_TILT_TOUCH: overriding touch bounds for this command to "
-                        f"X=[{min_x:.2f},{max_x:.2f}] Y=[{min_y:.2f},{max_y:.2f}] (margin {m:.2f})"
-                    )
 
             probed_points: list[tuple[float, float, float]] = []
-            for (sp, screw_nx, screw_ny, probe_nx, probe_ny) in probe_plan:
+            for (sp, screw_nx, screw_ny, probe_nx, probe_ny, clamped) in probe_plan:
                 coil_x, coil_y = self._nozzle_to_probe_xy(touch, probe_nx, probe_ny)
-                self.gcode.respond_info(
-                    f"{sp.label}: screw_nozzle=({screw_nx:.2f},{screw_ny:.2f}) "
-                    f"probe_nozzle=({probe_nx:.2f},{probe_ny:.2f}) coil=({coil_x:.2f},{coil_y:.2f})"
-                )
+                if clamped:
+                    self.gcode.respond_info(
+                        f"{sp.label}: screw_nozzle=({screw_nx:.2f},{screw_ny:.2f}) "
+                        f"probe_nozzle(clamped)=({probe_nx:.2f},{probe_ny:.2f}) coil=({coil_x:.2f},{coil_y:.2f})"
+                    )
+                else:
+                    self.gcode.respond_info(
+                        f"{sp.label}: screw_nozzle=({screw_nx:.2f},{screw_ny:.2f}) "
+                        f"probe_nozzle=({probe_nx:.2f},{probe_ny:.2f}) coil=({coil_x:.2f},{coil_y:.2f})"
+                    )
                 z = self._probe_at(touch, probe_nx, probe_ny, z_safe, speed, boundaries, samples)
                 probed_points.append((probe_nx, probe_ny, z))
                 self.gcode.respond_info(f"{sp.label}: z@probe= {z:.6f}")
+            if clamped_report:
+                for label, sx, sy, px, py in clamped_report:
+                    self.gcode.respond_info(
+                        f"SCREWS_TILT_TOUCH: clamp {label} ({sx:.2f},{sy:.2f}) -> ({px:.2f},{py:.2f})"
+                    )
         finally:
             if restored:
                 touch.boundaries = original_boundaries
@@ -428,4 +503,3 @@ class ScrewsTiltTouch:
             turns = adelta / self.pitch
             minutes_total = turns * 60.0
             self.gcode.respond_info(f"{sp.label}: Δ={delta:+.4f}mm -> {direction} {_format_turns(minutes_total)}")
-

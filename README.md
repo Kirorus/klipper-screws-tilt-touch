@@ -12,7 +12,7 @@ It was created to work around situations where Klipper’s builtin `[screws_tilt
   - Fits a plane to probed points and prints screw adjustment guidance (turns/minutes).
   - Routes moves via a configurable waypoint to avoid a nozzle-wipe zone.
   - Has safety/recovery for the common Cartographer error: **`Probe triggered prior to movement`**.
-  - Optional “boundary override” so you can keep `[bed_mesh]` restricted for a wipe zone, but still run screw calibration.
+  - Uses safe bounds derived from `[bed_mesh]` + Cartographer offsets, with optional per-axis clamp control.
 
 - **Example config**: `config/screws-tilt-adjust.cfg`
   - A ready-to-include `[screws_tilt_touch]` section.
@@ -26,7 +26,7 @@ Copy:
 
 - `klippy/extras/screws_tilt_touch.py` → `~/klipper/klippy/extras/screws_tilt_touch.py`
 
-Then restart Klipper (`RESTART` or `FIRMWARE_RESTART`).
+Then restart the Klipper **service** (not just `RESTART`), so Python modules reload.
 
 ### 2) Add the config
 
@@ -57,11 +57,14 @@ SCREWS_TILT_TOUCH_CALCULATE
 - `SPEED=150`
 - `Z=10`
 - `SAMPLES=1` (recommended default)
+- `CLAMP_X=1|0` (default 1)
+- `CLAMP_Y=1|0` (default 1)
 
 Example:
 
 ```gcode
 SCREWS_TILT_TOUCH_CALCULATE BASE=AVERAGE TOL=0.02 SPEED=150 Z=10 SAMPLES=1
+SCREWS_TILT_TOUCH_CALCULATE BASE=AVERAGE TOL=0.02 SPEED=150 Z=10 SAMPLES=1 CLAMP_Y=0
 ```
 
 ### Convenience macro
@@ -80,23 +83,24 @@ Cartographer coil XY is:
 
 `coil_xy = nozzle_xy + (x_offset, y_offset)`
 
-The module internally probes at a shifted nozzle position so that the **coil is above the screw**:
-
-`probe_nozzle_xy = screw_nozzle_xy - (x_offset, y_offset)`
+The module probes at the **nozzle screw coordinates** by default. If a screw is outside
+the safe bounds (derived from `[bed_mesh]` + offsets), it clamps **only the necessary
+axis** (X and/or Y) to the nearest safe point.
 
 ### Move routing (avoid nozzle-wipe zones)
 
 - `travel_via: center|none|custom`
 - `travel_via_x`, `travel_via_y` (if `custom`)
 
-### Touch boundary override (no need to widen `[bed_mesh]`)
+### Touch bounds and clamping
 
-If you deliberately restrict `[bed_mesh]` due to a wipe zone, but still want screw calibration:
+The module computes **safe nozzle bounds** from `[bed_mesh]` and Cartographer offsets,
+then applies them to Cartographer’s touch boundaries for the duration of the command.
 
-- `override_touch_bounds: 1`
-- `override_touch_bounds_margin: 1.0`
+You can disable clamping per axis:
 
-This temporarily expands `touch.boundaries` **only for the duration of `SCREWS_TILT_TOUCH_CALCULATE`**, and restores it afterwards.
+- `CLAMP_X=0` to allow X outside safe bounds
+- `CLAMP_Y=0` to allow Y outside safe bounds
 
 ### “Probe triggered prior to movement” recovery
 
@@ -123,4 +127,3 @@ install_script: install.sh
 ## License
 
 TBD (choose MIT / GPLv3 / etc.)
-
