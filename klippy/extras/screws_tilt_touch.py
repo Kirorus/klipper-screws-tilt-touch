@@ -146,6 +146,9 @@ class ScrewsTiltTouch:
         # Optional: temporarily override Cartographer touch boundaries for this command only.
         self.override_touch_bounds = bool(config.getint("override_touch_bounds", default=0, minval=0))
         self.override_touch_bounds_margin = config.getfloat("override_touch_bounds_margin", default=1.0, above=0.0)
+        # Whether to offset probe points by the Cartographer coil offset.
+        # Touch mode reports/operates in nozzle XY, so the default is off.
+        self.apply_coil_offset = bool(config.getint("apply_coil_offset", default=0, minval=0))
 
         self.screws: list[ScrewPoint] = []
         for i in range(1, 7):
@@ -338,12 +341,19 @@ class ScrewsTiltTouch:
         cfg = getattr(touch, "_config")
         x_offset = float(cfg.x_offset)
         y_offset = float(cfg.y_offset)
+        self.gcode.respond_info(
+            f"SCREWS_TILT_TOUCH: apply_coil_offset={int(self.apply_coil_offset)} (x_offset={x_offset:.3f}, y_offset={y_offset:.3f})"
+        )
 
         probe_plan: list[tuple[ScrewPoint, float, float, float, float]] = []
         for sp in self.screws:
             screw_nx, screw_ny = float(sp.x), float(sp.y)
-            probe_nx = screw_nx - x_offset
-            probe_ny = screw_ny - y_offset
+            if self.apply_coil_offset:
+                probe_nx = screw_nx - x_offset
+                probe_ny = screw_ny - y_offset
+            else:
+                probe_nx = screw_nx
+                probe_ny = screw_ny
             probe_plan.append((sp, screw_nx, screw_ny, probe_nx, probe_ny))
 
         restored = False
@@ -428,4 +438,3 @@ class ScrewsTiltTouch:
             turns = adelta / self.pitch
             minutes_total = turns * 60.0
             self.gcode.respond_info(f"{sp.label}: Δ={delta:+.4f}mm -> {direction} {_format_turns(minutes_total)}")
-
