@@ -80,15 +80,7 @@ Cartographer coil XY is:
 
 `coil_xy = nozzle_xy + (x_offset, y_offset)`
 
-Touch mode operates in nozzle XY, so by default the module probes **exactly at the screw nozzle XY**:
-
-`probe_nozzle_xy = screw_nozzle_xy`
-
-If you need legacy behavior (probe with the coil centered over the screw), enable:
-
-- `apply_coil_offset: 1`
-
-This will shift the nozzle to:
+The module internally probes at a shifted nozzle position so that the **coil is above the screw**:
 
 `probe_nozzle_xy = screw_nozzle_xy - (x_offset, y_offset)`
 
@@ -131,3 +123,4 @@ install_script: install.sh
 ## License
 
 TBD (choose MIT / GPLv3 / etc.)
+
